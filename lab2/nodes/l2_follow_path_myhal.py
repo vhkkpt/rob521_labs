@@ -148,8 +148,13 @@ class PathFollower():
 
             print("TO DO: Propogate the trajectory forward, storing the resulting points in local_paths!")
             for t in range(1, self.horizon_timesteps + 1):
-                # propogate trajectory forward, assuming perfect control of velocity and no dynamic effects
-                pass
+                for opt_idx, (trans_vel, rot_vel) in enumerate(self.all_opts):
+                    prev_pose = local_paths[t - 1, opt_idx]
+                    delta_x = trans_vel * INTEGRATION_DT * np.cos(prev_pose[2])
+                    delta_y = trans_vel * INTEGRATION_DT * np.sin(prev_pose[2])
+                    delta_theta = rot_vel * INTEGRATION_DT
+                    local_paths[t, opt_idx] = [prev_pose[0] + delta_x, prev_pose[1] + delta_y, prev_pose[2] + delta_theta]
+
 
             # check all trajectory points for collisions
             # first find the closest collision point in the map to each local path point
@@ -158,20 +163,38 @@ class PathFollower():
             local_paths_lowest_collision_dist = np.ones(self.num_opts) * 50
 
             print("TO DO: Check the points in local_path_pixels for collisions")
-            for opt in range(local_paths_pixels.shape[1]):
-                for timestep in range(local_paths_pixels.shape[0]):
-                    pass
+            for opt in range(self.num_opts):
+                for timestep in range(1, self.horizon_timesteps + 1):  # Skip the first one as it is the current position
+                    x_pix, y_pix = np.floor(local_paths_pixels[timestep, opt, :2]).astype(int)
+                    # Check map boundaries
+                    if 0 <= x_pix < self.map_np.shape[1] and 0 <= y_pix < self.map_np.shape[0]:
+                        if self.map_np[y_pix, x_pix] > 0:  # Assuming non-zero values indicate obstacles
+                            local_paths_lowest_collision_dist[opt] = min(local_paths_lowest_collision_dist[opt], timestep)
+                            break
+                    else:
+                        # Out of map bounds is also considered a collision
+                        local_paths_lowest_collision_dist[opt] = min(local_paths_lowest_collision_dist[opt], timestep)
+                        break
+
 
             # remove trajectories that were deemed to have collisions
             print("TO DO: Remove trajectories with collisions!")
 
             # calculate final cost and choose best option
             print("TO DO: Calculate the final cost and choose the best control option!")
-            final_cost = np.zeros(self.num_opts)
-            if final_cost.size == 0:  # hardcoded recovery if all options have collision
-                control = [-.1, 0]
+
+            final_cost = np.full(self.num_opts, np.inf)  # Initialize all costs as infinity
+            for opt in valid_opts:
+                if local_paths_lowest_collision_dist[opt] == 50:  # Assume 50 is the max distance without collision
+                    # Distance to the goal (simplified example)
+                    final_pose = local_paths[-1, opt]  # Get the final pose from the trajectory
+                    goal_dist = np.linalg.norm(self.cur_goal[:2] - final_pose[:2])
+                    final_cost[opt] = goal_dist  # Here, we just consider distance to the goal for simplicity
+
+            if np.min(final_cost) == np.inf:  # If all paths lead to collision
+                control = [-.1, 0]  # Example recovery behavior
             else:
-                best_opt = valid_opts[final_cost.argmin()]
+                best_opt = np.argmin(final_cost)
                 control = self.all_opts[best_opt]
                 self.local_path_pub.publish(utils.se2_pose_list_to_path(local_paths[:, best_opt], 'map'))
 
