@@ -16,19 +16,21 @@ from visualization_msgs.msg import Marker
 # ros and se2 conversion utils
 import utils
 
+from skimage.draw import disk
+
 
 TRANS_GOAL_TOL = .1  # m, tolerance to consider a goal complete
 ROT_GOAL_TOL = .3  # rad, tolerance to consider a goal complete
-TRANS_VEL_OPTS = [0, 0.025, 0.13, 0.26]  # m/s, max of real robot is .26
+TRANS_VEL_OPTS = np.linspace(-0.26, 0.26, 7)  # m/s, max of real robot is .26
 ROT_VEL_OPTS = np.linspace(-1.82, 1.82, 11)  # rad/s, max of real robot is 1.82
 CONTROL_RATE = 5  # Hz, how frequently control signals are sent
-CONTROL_HORIZON = 5  # seconds. if this is set too high and INTEGRATION_DT is too low, code will take a long time to run!
+CONTROL_HORIZON = 1.0  # seconds. if this is set too high and INTEGRATION_DT is too low, code will take a long time to run!
 INTEGRATION_DT = .025  # s, delta t to propagate trajectories forward by
 COLLISION_RADIUS = 0.225  # m, radius from base_link to use for collisions, min of 0.2077 based on dimensions of .281 x .306
 ROT_DIST_MULT = .1  # multiplier to change effect of rotational distance in choosing correct control
 OBS_DIST_MULT = .1  # multiplier to change the effect of low distance to obstacles on a path
 MIN_TRANS_DIST_TO_USE_ROT = TRANS_GOAL_TOL  # m, robot has to be within this distance to use rot distance in cost
-PATH_NAME = 'path.npy'  # saved path from l2_planning.py, should be in the same directory as this file
+PATH_NAME = 'shortest_path.npy'  # saved path from l2_planning.py, should be in the same directory as this file
 
 # here are some hardcoded paths to use if you want to develop l2_planning and this file in parallel
 # TEMP_HARDCODE_PATH = [[2, 0, 0], [2.75, -1, -np.pi/2], [2.75, -4, -np.pi/2], [2, -4.4, np.pi]]  # almost collision-free
@@ -47,6 +49,12 @@ def load_map(filename):
     im_np = np.array(im)  #Whitespace is true, black is false
     im_np = np.logical_not(im_np)     #for ros
     return im_np
+
+def unif_theta(t):
+    t = np.mod(t, np.pi * 2)
+    if t > np.pi:
+        t -= np.pi * 2
+    return t
 
 class PathFollower():
     def __init__(self):
@@ -106,7 +114,7 @@ class PathFollower():
         cur_dir = os.path.dirname(os.path.realpath(__file__))
 
         # to use the temp hardcoded paths above, switch the comment on the following two lines
-        self.path_tuples = np.load(os.path.join(cur_dir, 'path.npy')).T
+        self.path_tuples = np.load(os.path.join(cur_dir, PATH_NAME)).T
         # self.path_tuples = np.array(TEMP_HARDCODE_PATH)
 
         self.path = utils.se2_pose_list_to_path(self.path_tuples, 'map')
@@ -146,55 +154,57 @@ class PathFollower():
             local_paths = np.zeros([self.horizon_timesteps + 1, self.num_opts, 3])
             local_paths[0] = np.atleast_2d(self.pose_in_map_np).repeat(self.num_opts, axis=0)
 
-            print("TO DO: Propogate the trajectory forward, storing the resulting points in local_paths!")
-            for t in range(1, self.horizon_timesteps + 1):
-                for opt_idx, (trans_vel, rot_vel) in enumerate(self.all_opts):
-                    prev_pose = local_paths[t - 1, opt_idx]
-                    delta_x = trans_vel * INTEGRATION_DT * np.cos(prev_pose[2])
-                    delta_y = trans_vel * INTEGRATION_DT * np.sin(prev_pose[2])
-                    delta_theta = rot_vel * INTEGRATION_DT
-                    local_paths[t, opt_idx] = [prev_pose[0] + delta_x, prev_pose[1] + delta_y, prev_pose[2] + delta_theta]
-
+            # print("TO DO: Propogate the trajectory forward, storing the resulting points in local_paths!")
+            for i, vw in enumerate(self.all_opts):
+                p = np.array(vw)[:, np.newaxis]
+                for t in range(1, self.horizon_timesteps + 1):
+                    q = (local_paths[t - 1, i, :])[:, np.newaxis]
+                    G_q = np.array([
+                        [np.cos(q[2, 0]), 0],
+                        [np.sin(q[2, 0]), 0],
+                        [0, 1]
+                    ])
+                    q_dot = G_q @ p
+                    local_paths[t, i, :] = (q + q_dot * INTEGRATION_DT).flatten()
 
             # check all trajectory points for collisions
             # first find the closest collision point in the map to each local path point
             local_paths_pixels = (self.map_origin[:2] + local_paths[:, :, :2]) / self.map_resolution
-            valid_opts = range(self.num_opts)
-            local_paths_lowest_collision_dist = np.ones(self.num_opts) * 50
+            # valid_opts = range(self.num_opts)
+            # local_paths_lowest_collision_dist = np.ones(self.num_opts) * 50
 
-            print("TO DO: Check the points in local_path_pixels for collisions")
-            for opt in range(self.num_opts):
-                for timestep in range(1, self.horizon_timesteps + 1):  # Skip the first one as it is the current position
-                    x_pix, y_pix = np.floor(local_paths_pixels[timestep, opt, :2]).astype(int)
-                    # Check map boundaries
-                    if 0 <= x_pix < self.map_np.shape[1] and 0 <= y_pix < self.map_np.shape[0]:
-                        if self.map_np[y_pix, x_pix] > 0:  # Assuming non-zero values indicate obstacles
-                            local_paths_lowest_collision_dist[opt] = min(local_paths_lowest_collision_dist[opt], timestep)
-                            break
-                    else:
-                        # Out of map bounds is also considered a collision
-                        local_paths_lowest_collision_dist[opt] = min(local_paths_lowest_collision_dist[opt], timestep)
+            # print("TO DO: Check the points in local_path_pixels for collisions")
+            mask = np.full(self.num_opts, True)
+            for opt in range(local_paths_pixels.shape[1]):
+                for t in range(local_paths_pixels.shape[0]):
+                    c = local_paths_pixels[t, opt, :]
+                    rr, cc = disk((c[1], c[0]), COLLISION_RADIUS / self.map_resolution, shape=self.map_np.shape)
+                    if np.any(self.map_np[rr, cc]):
+                        mask[opt] = False
                         break
 
 
             # remove trajectories that were deemed to have collisions
-            print("TO DO: Remove trajectories with collisions!")
+            # print("TO DO: Remove trajectories with collisions!")
+            valid_opts = np.array(range(self.num_opts))[mask]
 
             # calculate final cost and choose best option
-            print("TO DO: Calculate the final cost and choose the best control option!")
+            # print("TO DO: Calculate the final cost and choose the best control option!")
+            final_cost = np.zeros_like(valid_opts, dtype=float)
 
-            final_cost = np.full(self.num_opts, np.inf)  # Initialize all costs as infinity
-            for opt in valid_opts:
-                if local_paths_lowest_collision_dist[opt] == 50:  # Assume 50 is the max distance without collision
-                    # Distance to the goal (simplified example)
-                    final_pose = local_paths[-1, opt]  # Get the final pose from the trajectory
-                    goal_dist = np.linalg.norm(self.cur_goal[:2] - final_pose[:2])
-                    final_cost[opt] = goal_dist  # Here, we just consider distance to the goal for simplicity
+            g = self.cur_goal
+            for vi, opt in enumerate(valid_opts):
+                t = local_paths[-1, opt, :]
+                dist = np.linalg.norm(g[:2] - t[:2])
+                theta = unif_theta(g[2] - t[2])
+                cost = dist + 0.01 * np.abs(theta)
+                final_cost[vi] = cost
 
-            if np.min(final_cost) == np.inf:  # If all paths lead to collision
-                control = [-.1, 0]  # Example recovery behavior
+
+            if final_cost.size == 0:  # hardcoded recovery if all options have collision
+                control = [-.1, 0]
             else:
-                best_opt = np.argmin(final_cost)
+                best_opt = valid_opts[final_cost.argmin()]
                 control = self.all_opts[best_opt]
                 self.local_path_pub.publish(utils.se2_pose_list_to_path(local_paths[:, best_opt], 'map'))
 
